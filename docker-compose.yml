@@ -1,0 +1,16 @@
+services:
+  pixiv-danbooru-bridge:
+    image: ghcr.io/animearchive/pixiv-danbooru-bridge:latest
+    # To build from source instead of pulling, replace the line above with:
+    # build: .
+    container_name: pixiv-danbooru-bridge
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    env_file: .env
+    volumes:
+      # tag-mapping database + rotated pixiv token; keep it across updates
+      - pixiv-bridge-data:/data
+
+volumes:
+  pixiv-bridge-data:
