@@ -87,7 +87,7 @@ class Base(unittest.TestCase):
 class TestMapping(Base):
     def test_sync_stats(self):
         st = self.bridge.mapping.stats()
-        self.assertEqual((st["wiki_pages"], st["pixiv_artists"], st["full_sync_done"]), (6, 1, True))
+        self.assertEqual((st["wiki_pages"], st["pixiv_artists"], st["full_sync_done"]), (8, 1, True))
 
     def test_name_ordering(self):
         from bridge.mapping import order_pixiv_names
@@ -96,39 +96,103 @@ class TestMapping(Base):
         self.assertEqual(order_pixiv_names(["青空", "蒼空", "青い空"])[0], "青空")            # kanji-only Japanese kept
         self.assertEqual(order_pixiv_names(["blue_eyes", "青い目"])[0], "青い目")
         self.assertEqual(order_pixiv_names(["黑发", "黒髪", "黒髪ロング"], {"黒髪": 5})[0], "黒髪")  # learned usage wins
+        # a compound name (also another tag) never becomes the main search name, even if seen often
+        self.assertEqual(order_pixiv_names(["ロングヘア", "黒髪ロング"], {"黒髪ロング": 50}, {"黒髪ロング"})[0], "ロングヘア")
+        self.assertEqual(order_pixiv_names(["ロングヘア", "长发"], {"长发": 50})[0], "ロングヘア")
 
     def test_lookups(self):
         m = self.bridge.mapping
         self.assertEqual(m.pixiv_names("blue_sky"), ["青空", "蒼空"])
-        self.assertEqual(m.to_danbooru(["初音ミク", "蒼空", "vocaloid", "風景"]),
-                         {"初音ミク": "hatsune_miku", "蒼空": "blue_sky", "vocaloid": "vocaloid"})
+        self.assertEqual(m.to_danbooru(["初音ミク", "蒼空", "vocaloid", "风景_x"]),
+                         {"初音ミク": ["hatsune_miku"], "蒼空": ["blue_sky"], "vocaloid": ["vocaloid"]})
+        # one pixiv name -> several Danbooru tags; Chinese names convert too
+        self.assertEqual(m.to_danbooru(["黒髪ロング", "长发", "黑发"]),
+                         {"黒髪ロング": ["long_hair", "black_hair"], "长发": ["long_hair"], "黑发": ["black_hair"]})
+        # a rare tag that happens to list the same name is filtered out
+        self.assertEqual(m.to_danbooru(["ミク"]), {"ミク": ["hatsune_miku"]})
+        self.assertEqual(m.search_names("long_hair"), ["ロングヘア", "黒髪ロング", "长发"])
         self.assertEqual(m.artist_for_user(111), "miso_tanu")
         self.assertEqual(m.users_for_artist("miso_tanu"), [111])
         self.assertEqual(m.category("hatsune_miku")[0], 4)
 
 
+    def test_translation_fallback_and_noise(self):
+        m = self.bridge.mapping
+        # no wiki lists 夜空, but pixiv translates it "night sky" and night_sky is a Danbooru tag
+        fakes.TAGS.append({"id": 20, "name": "night_sky", "category": 0, "post_count": 90000})
+        self.assertEqual(m.to_danbooru(["夜空", "落書き"], {"夜空": "night sky", "落書き": "doodle_xyz"}),
+                         {"夜空": ["night_sky"]})
+        self.assertIn("夜空", m.pixiv_names("night_sky"))  # remembered for searching
+        # a name listed on many wiki pages is a grouping label -> left unmapped
+        rows = [{"id": 50 + i, "title": f"char_{i}_(costume)", "other_names": ["英霊祝装"]} for i in range(6)]
+        m._store_wiki(rows)
+        m._store_tags([{"name": r["title"], "category": 4, "post_count": 100} for r in rows])
+        self.assertEqual(m.to_danbooru(["英霊祝装"]), {})
+        # wiki pages that are not tags (list_of_*) are ignored
+        m._store_wiki([{"id": 70, "title": "list_of_uniforms", "other_names": ["制服"]}])
+        m._store_wiki([{"id": 71, "title": "school_uniform", "other_names": ["制服"]}])
+        m._store_tags([{"name": "school_uniform", "category": 0, "post_count": 1000000}])
+        self.assertEqual(m.to_danbooru(["制服"]), {"制服": ["school_uniform"]})
+
+    def test_unknown_names_are_looked_up_after_sync(self):
+        m = self.bridge.mapping
+        # Danbooru gains a wiki page and an artist after our sync
+        fakes.WIKI.append({"id": 9, "title": "night_sky", "other_names": ["夜空"], "updated_at": "x", "is_deleted": False})
+        fakes.TAGS.append({"id": 19, "name": "night_sky", "category": 0, "post_count": 90000})
+        fakes.ARTISTS.append({"id": 101, "name": "chen_art", "is_deleted": False, "updated_at": "x",
+                              "urls": [{"url": "https://www.pixiv.net/users/555"}]})
+        self.assertEqual(m.to_danbooru(["夜空"]), {"夜空": ["night_sky"]})
+        self.assertEqual(m.category("night_sky")[0], 0)
+        self.assertEqual(m.artists_for_users([555, 222]), {555: "chen_art"})
+        before = len(fakes.requests_to("/danbooru/"))
+        m.to_danbooru(["夜空", "風景"]), m.artists_for_users([222])  # known/missed: no new requests
+        m.to_danbooru(["風景"]), m.artists_for_users([222])
+        self.assertEqual(len(fakes.requests_to("/danbooru/")), before + 1)  # only 風景 (new) was asked once
+
+
 class TestSearch(Base):
     def test_empty_query_uses_follow_feed(self):
-        self.assertEqual(self.ids(""), [1004000, 1003000, 1002000, 1002001, 1002002, 1001000])
+        self.assertEqual(self.ids(""), [1004000, 1003000, 1002000, 1002001, 1002002, 1001000, 1005000, 1006000])
         self.assertTrue(fakes.requests_to("/app/v2/illust/follow"))
 
     def test_danbooru_tag_is_searched_as_pixiv_tag(self):
         self.assertEqual(self.ids("hatsune_miku"), [1004000, 1002000, 1002001, 1002002, 1001000])
-        self.assertEqual(self.pixiv_words()[0], "初音ミク")
+        self.assertEqual(self.pixiv_words()[0], "初音ミク OR ミク")
 
     def test_and_negation_and_local_filters(self):
         self.assertEqual(self.ids("hatsune_miku long_hair"), [1002000, 1002001, 1002002])
-        self.assertEqual(self.pixiv_words()[0], "初音ミク ロングヘア")
+        self.assertEqual(self.pixiv_words()[0], "(初音ミク OR ミク) (ロングヘア OR 黒髪ロング OR 长发)")
         self.assertEqual(self.ids("blue_sky -rating:e"), [1001000])
         self.assertEqual(self.ids("blue_sky width:>2000"), [1003000])
         self.assertEqual(self.ids("hatsune_miku -kaito_(vocaloid)"), [1004000, 1001000])
-        self.assertIn("初音ミク -KAITO", self.pixiv_words())
+        self.assertIn("(初音ミク OR ミク) -KAITO", self.pixiv_words())
         self.assertEqual(self.ids("hatsune_miku score:>=100"), [1002000, 1002001, 1002002, 1001000])
         self.assertEqual(self.ids("hatsune_miku is:ugoira"), [1004000])
 
     def test_or(self):
-        self.assertEqual(self.ids("~long_hair ~original"), [1003000, 1002000, 1002001, 1002002])
-        self.assertEqual(self.pixiv_words()[0], "ロングヘア OR オリジナル")
+        self.assertEqual(self.ids("~long_hair ~original"),
+                         [1003000, 1002000, 1002001, 1002002, 1005000, 1006000])
+        self.assertEqual(self.pixiv_words()[0], "ロングヘア OR 黒髪ロング OR 长发 OR オリジナル OR 原创")
+        self.assertEqual(self.ids("blue_sky (long_hair or original)"), [1003000])
+        self.assertEqual(self.pixiv_words()[-1], "(青空 OR 蒼空) (ロングヘア OR 黒髪ロング OR 长发 OR オリジナル OR 原创)")
+
+    def test_chinese_and_multi_tag_works_are_found(self):
+        self.assertEqual(self.ids("long_hair"), [1002000, 1002001, 1002002, 1005000, 1006000])
+        self.assertEqual(self.ids("black_hair"), [1005000])
+        self.assertEqual(self.ids("original -blue_sky"), [1006000])
+
+    def test_stand_in_names_can_be_searched(self):
+        self.ids("")  # browse once so the bridge sees these works
+        self.assertEqual(self.ids("someone"), [1003000, 1002000, 1002001, 1002002])
+        self.assertEqual(fakes.requests_to("/app/v1/user/illusts")[-1][2]["user_id"], "222")
+        self.assertEqual(self.ids("scenery"), [1003000])  # shown for pixiv tag 風景
+        self.assertEqual(self.pixiv_words()[-1], "風景")
+
+    def test_danbooru_aliases_are_followed(self):
+        self.assertEqual(self.ids("kaito"), [1002000, 1002001, 1002002])  # alias of kaito_(vocaloid)
+        self.assertEqual(self.pixiv_words()[0], "KAITO")
+        self.assertEqual(self.bridge.mapping.to_danbooru(["カイト"], {"カイト": "kaito"}),
+                         {"カイト": ["kaito_(vocaloid)"]})
 
     def test_artist_tag_uses_user_works(self):
         self.assertEqual(self.ids("miso_tanu"), [1001000])
@@ -184,6 +248,11 @@ class TestPostFormat(Base):
         self.assertEqual(p["tag_string_copyright"], "original")
         self.assertEqual(p["tag_string_meta"], "absurdres ai-generated highres")
         self.assertEqual(p["tag_string_artist"], "someone")  # no Danbooru artist -> pixiv account
+        s, p = self.req("/posts/1005000.json")
+        self.assertEqual(p["tag_string_general"], "black_hair long_hair")  # 黒髪ロング -> 2 tags
+        self.assertEqual(p["tag_string_artist"], "original_(444)")  # account name is a Danbooru tag
+        s, p = self.req("/posts/1006000.json")
+        self.assertEqual((p["tag_string_general"], p["tag_string_copyright"]), ("long_hair", "original"))
         s, p = self.req("/posts/1002001.json")
         self.assertEqual((p["rating"], p["parent_id"]), ("s", 1002000))
         self.assertIn("_p1.jpg", p["file_url"])

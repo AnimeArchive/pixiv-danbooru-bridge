@@ -13,10 +13,12 @@ REQUESTS = []
 WIKI = [
     {"id": 1, "title": "blue_sky", "other_names": ["青空", "蒼空"]},
     {"id": 2, "title": "hatsune_miku", "other_names": ["初音ミク", "ミク"]},
-    {"id": 3, "title": "original", "other_names": ["オリジナル"]},
+    {"id": 3, "title": "original", "other_names": ["オリジナル", "原创"]},
     {"id": 4, "title": "vocaloid", "other_names": ["VOCALOID", "ボーカロイド"]},
-    {"id": 5, "title": "long_hair", "other_names": ["ロングヘア"]},
+    {"id": 5, "title": "long_hair", "other_names": ["ロングヘア", "黒髪ロング", "长发"]},
     {"id": 6, "title": "kaito_(vocaloid)", "other_names": ["KAITO"]},
+    {"id": 7, "title": "black_hair", "other_names": ["黒髪", "黑发", "黒髪ロング"]},
+    {"id": 8, "title": "diana_(pokemon)", "other_names": ["ミク"]},  # noise: rare tag sharing a name
 ]
 for w in WIKI:
     w.update(updated_at="2026-09-01T00:00:00.000-04:00", is_deleted=False)
@@ -28,7 +30,10 @@ TAGS = [
     {"id": 14, "name": "long_hair", "category": 0, "post_count": 5000000},
     {"id": 15, "name": "kaito_(vocaloid)", "category": 4, "post_count": 20000},
     {"id": 16, "name": "miso_tanu", "category": 1, "post_count": 300},
+    {"id": 17, "name": "black_hair", "category": 0, "post_count": 2200000},
+    {"id": 18, "name": "diana_(pokemon)", "category": 4, "post_count": 5},
 ]
+ALIASES = [{"antecedent_name": "kaito", "consequent_name": "kaito_(vocaloid)"}]
 ARTISTS = [{"id": 100, "name": "miso_tanu", "is_deleted": False, "updated_at": "2026-09-01T00:00:00.000-04:00",
             "urls": [{"url": "https://www.pixiv.net/users/111"}, {"url": "https://x.com/miso_tanu"}]}]
 
@@ -60,13 +65,21 @@ def danbooru(path, q):
         if "search[name]" in q:
             rows = [a for a in rows if a["name"] == q["search[name]"]]
         url = q.get("search[url_matches]", "")
-        if url and "*" not in url:
-            rows = [a for a in rows if any(u["url"] == url for u in a["urls"])]
+        if url and "*" not in url:  # space-separated list of exact urls
+            wanted = set(url.split())
+            rows = [a for a in rows if any(u["url"] in wanted for u in a["urls"])]
         return _cursor(rows, q)
+    if path == "/tag_aliases.json":
+        want = set(q.get("search[antecedent_name_comma]", "").split(","))
+        return [a for a in ALIASES if a["antecedent_name"] in want]
     if path == "/tags.json":
         rows = TAGS
         if "search[name]" in q:
             rows = [t for t in rows if t["name"] == q["search[name]"]]
+        if "search[name_comma]" in q:
+            want = set(q["search[name_comma]"].split(","))
+            rows = [t for t in rows if t["name"] in want]
+            q = dict(q, page="b999999")
         return _cursor(rows, q)
     return None
 
@@ -101,9 +114,13 @@ def _illust(iid, user, tags, w, h, date, pages=1, x_restrict=0, sanity=2, bookma
 
 
 ILLUSTS = {}
+BASE = {"wiki": [dict(w) for w in WIKI], "tags": [dict(t) for t in TAGS], "artists": [dict(a) for a in ARTISTS]}
 
 
 def reset():
+    WIKI[:] = [dict(w) for w in BASE["wiki"]]
+    TAGS[:] = [dict(t) for t in BASE["tags"]]
+    ARTISTS[:] = [dict(a) for a in BASE["artists"]]
     ILLUSTS.clear()
     for i in (
         _illust(1001, (111, "MisoTanu"), [("初音ミク", "hatsune miku"), ("青空", "blue sky"), ("VOCALOID", None)],
@@ -114,6 +131,10 @@ def reset():
                 3500, 2500, "2026-09-20", x_restrict=1, bookmarks=50, ai=2),
         _illust(1004, (333, "Anim"), [("初音ミク", None), ("うごイラ", "ugoira")], 600, 600, "2026-09-25",
                 kind="ugoira", bookmarks=5),
+        # one pixiv tag -> two Danbooru tags; account name collides with a Danbooru tag
+        _illust(1005, (444, "Original"), [("黒髪ロング", None)], 700, 1000, "2026-08-20", bookmarks=3),
+        # tagged in Chinese only
+        _illust(1006, (555, "Chen"), [("长发", None), ("原创", None)], 700, 1000, "2026-08-15", bookmarks=2),
     ):
         ILLUSTS[i["id"]] = i
     REQUESTS.clear()
@@ -134,11 +155,16 @@ def _page(items, q, base_path, base):
 
 
 def _matches(illust, word):
+    """pixiv search syntax: AAA (BBB OR CCC) -DDD, or a bare A OR B."""
+    import re
     names = {t["name"].lower() for t in illust["tags"]}
-    if " OR " in word:
-        return any(w.lower() in names for w in word.split(" OR "))
-    for term in word.split():
-        if term.startswith("-"):
+    if "(" not in word and " OR " in word:
+        return any(w.strip().lower() in names for w in word.split(" OR "))
+    for group, term in re.findall(r"\(([^)]*)\)|(\S+)", word):
+        if group:
+            if not any(w.strip().lower() in names for w in group.split(" OR ")):
+                return False
+        elif term.startswith("-"):
             if term[1:].lower() in names:
                 return False
         elif term.lower() not in names:

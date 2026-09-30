@@ -15,18 +15,44 @@ Danbooru's wiki keeps an `other_names` list for each tag with its pixiv/Japanese
 (`blue_sky` → `青空, 蒼空, …`), and Danbooru artist entries list their pixiv profile URLs.
 The bridge keeps a local SQLite copy of both:
 
-- **Danbooru → pixiv** (searching): each tag is searched as its best pixiv name, and an
-  artist tag searches that artist's pixiv works directly. Danbooru's `other_names` sometimes
-  list a Chinese name first (`long_hair` → `长发`), so the bridge prefers Japanese spellings and
-  learns which spellings really appear in pixiv results. You can pin any tag with
-  `PIXIV_TAG_OVERRIDES`, e.g. `{"black_hair": "黒髪"}`.
-- **pixiv → Danbooru** (results): each pixiv tag is mapped back to a Danbooru tag, with the
-  right category (artist / copyright / character / general / meta). When a pixiv name belongs
-  to several Danbooru tags, the one that lists it first wins, then the more popular one.
-- Pixiv tags with no Danbooru match are shown as pixiv's English translation (or the
-  original name; see `UNMAPPED_TAG_STYLE`).
-- The artist tag comes from Danbooru's artist database; if the artist isn't there, the pixiv
-  account name is used.
+- **Danbooru → pixiv** (searching): each tag is searched as a group of its best Japanese
+  names plus its Chinese name, using pixiv's `AAA (BBB OR CCC)` syntax. So `long_hair` becomes
+  `(ロングヘアー OR ロングヘア OR 长发)`, which also finds works tagged only in Chinese.
+  - Danbooru's `other_names` sometimes list a Chinese name first, so Japanese spellings are
+    preferred, and the bridge learns which spellings really appear in pixiv results.
+  - Compound names such as `黒髪ロング` are never used as a tag's main name.
+  - Danbooru aliases are followed: `kancolle` searches `kantai_collection`.
+  - An artist tag searches that artist's pixiv works directly.
+  - You can pin any tag with `PIXIV_TAG_OVERRIDES`, e.g. `{"black_hair": "黒髪"}`.
+  - `PIXIV_SEARCH_ALIASES=1` searches only the single best name.
+- **pixiv → Danbooru** (results): each pixiv tag is mapped back to Danbooru tags with the
+  right category (artist / copyright / character / general / meta).
+  - Chinese pixiv tags convert too (`长发` → `long_hair`).
+  - One pixiv tag can become several Danbooru tags: `黒髪ロング` → `black_hair` + `long_hair`,
+    and `カイミク` → `kaito_(vocaloid)` + `hatsune_miku`.
+  - Noise is filtered out: wiki pages that aren't tags, matches with under 1% of the best
+    match's posts, and "grouping" names listed on many pages (costume series etc.), which are
+    left unmapped rather than guessed.
+  - If no Danbooru wiki lists a pixiv tag, pixiv's own English translation is tried
+    (`夜空` → "night sky"). It is used if that is a Danbooru tag or alias, and remembered so the
+    tag can be searched.
+
+### When there is no Danbooru equivalent
+
+This happens a lot, especially for artists: Danbooru knows about 355k pixiv accounts, and
+pixiv has millions.
+
+- **Unknown pixiv tags** are shown as pixiv's English translation, or the original name if
+  there is none (`UNMAPPED_TAG_STYLE`).
+- **Unknown artists** get their pixiv account name as the artist tag, or `name_(pixiv id)` if
+  that name is already a different Danbooru tag.
+- The bridge remembers every stand-in name it shows, so **searching for it works**: the artist
+  tag `someone` lists that pixiv user's works, and `doodle` searches the pixiv tag `落書き`.
+- New names are looked up on Danbooru as soon as they appear, even after the full sync, so
+  tags Danbooru adds later get picked up. A couple of batched requests are made right away;
+  the rest run in the background (`DANBOORU_LIVE_LOOKUP_BUDGET`). Seeing new names also pulls
+  Danbooru's recent changes if the last sync is more than 6 hours old. Names Danbooru really
+  doesn't have are remembered as misses for a week, so they aren't looked up again and again.
 - The bridge also adds `highres`, `absurdres`, `ai-generated`, `animated`/`ugoira`, `comic`
   and `multiple_images` like Danbooru does.
 

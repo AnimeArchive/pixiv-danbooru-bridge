@@ -51,6 +51,12 @@ class Config:
         self.danbooru_min_interval = _float("DANBOORU_MIN_INTERVAL", 1.0)
         # Look up tags live on Danbooru when they are not in the local database yet.
         self.live_lookups = _bool("DANBOORU_LIVE_LOOKUPS", True)
+        # Danbooru requests made immediately per page of results for unknown tags;
+        # the rest are looked up in the background.
+        self.live_lookup_budget = _int("DANBOORU_LIVE_LOOKUP_BUDGET", 2)
+        # How many pixiv names of a tag are OR-ed together when searching
+        # (best Japanese names + a Chinese name). 1 = only the best name.
+        self.search_aliases = _int("PIXIV_SEARCH_ALIASES", 3)
         # Sync the mapping database on start-up and then every N hours (0 = never).
         self.sync_on_start = _bool("SYNC_ON_START", True)
         self.sync_interval_hours = _float("SYNC_INTERVAL_HOURS", 24)

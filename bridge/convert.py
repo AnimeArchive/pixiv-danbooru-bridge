@@ -99,8 +99,9 @@ class Converter:
     def lookup_id(self, tid):
         return self._ids.get(tid)
 
-    def illust_tags(self, illust, mapped):
-        """-> ({category: set(names)}, raw_keys)"""
+    def illust_tags(self, illust, mapped, artists, remember):
+        """-> ({category: set(names)}, raw_keys). `remember` collects stand-in
+        names for pixiv tags/artists Danbooru doesn't know, so they can be searched."""
         cats = {CAT_GENERAL: set(), CAT_ARTIST: set(), CAT_COPYRIGHT: set(), CAT_CHARACTER: set(), CAT_META: set()}
         raw_keys = set()
         for t in illust.get("tags") or []:
@@ -110,19 +111,25 @@ class Converter:
                 raw_keys.add(key(tr))
             if name.lower() in RATING_TAGS:
                 continue
-            dan = mapped.get(name)
-            if dan:
-                cat, _ = self.mapping.category(dan)
-                cats.setdefault(cat if cat is not None else CAT_GENERAL, set()).add(dan)
+            dans = mapped.get(name)
+            if dans:
+                for dan in dans:  # one pixiv tag can be several Danbooru tags
+                    cat, _ = self.mapping.category(dan)
+                    cats.setdefault(cat if cat is not None else CAT_GENERAL, set()).add(dan)
                 continue
             style = self.cfg.unmapped_tag_style
             if style == "drop":
                 continue
-            label = tr if (style == "translated" and tr) else name
-            cats[CAT_GENERAL].add(booru_name(label))
+            label = booru_name(tr if (style == "translated" and tr) else name)
+            cats[CAT_GENERAL].add(label)
+            remember["tags"].append((label, name))
         user = illust.get("user") or {}
-        artist = self.mapping.artist_for_user(user.get("id")) if user.get("id") else None
-        cats[CAT_ARTIST].add(artist or booru_name(user.get("account") or user.get("name") or "unknown_artist"))
+        uid = user.get("id")
+        artist = artists.get(int(uid)) if uid else None
+        if not artist:
+            artist = self.mapping.local_artist_name(uid, user.get("account") or user.get("name") or "")
+            remember["users"].append((uid, user.get("account") or "", user.get("name") or "", artist))
+        cats[CAT_ARTIST].add(artist)
         raw_keys |= {key(user.get("account") or ""), key(user.get("name") or "")}
         w, h = illust.get("width") or 0, illust.get("height") or 0
         if w >= 1600 or h >= 1200:
@@ -143,19 +150,23 @@ class Converter:
     def posts(self, illusts, base, pages_mode=None):
         """-> list of (post_dict, context) for every visible page."""
         pages_mode = pages_mode or self.cfg.pages_mode
+        illusts = [i for i in illusts if i.get("visible", True)]
         all_tags = {t.get("name") for i in illusts for t in (i.get("tags") or []) if t.get("name")}
-        mapped = self.mapping.to_danbooru(sorted(all_tags))
+        translations = {t["name"]: t.get("translated_name") for i in illusts for t in (i.get("tags") or [])
+                        if t.get("name") and t.get("translated_name")}
+        mapped = self.mapping.to_danbooru(sorted(all_tags), translations)
+        artists = self.mapping.artists_for_users([(i.get("user") or {}).get("id") for i in illusts])
+        remember = {"tags": [], "users": []}
         out = []
         for illust in illusts:
-            if not illust.get("visible", True):
-                continue
-            cats, raw_keys = self.illust_tags(illust, mapped)
+            cats, raw_keys = self.illust_tags(illust, mapped, artists, remember)
             n_pages = illust.get("page_count") or 1
             for page in range(n_pages if pages_mode == "all" else 1):
                 urls = page_urls(illust, page)
                 if not urls or not urls.get("original") or "s.pximg.net" in urls["original"]:
                     continue
                 out.append(self.post(illust, page, urls, cats, raw_keys, base))
+        self.mapping.remember_local(remember["tags"], remember["users"])
         return out
 
     def post(self, illust, page, urls, cats, raw_keys, base):

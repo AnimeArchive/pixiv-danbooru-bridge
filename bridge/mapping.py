@@ -22,9 +22,17 @@ log = logging.getLogger("bridge.mapping")
 
 PIXIV_USER_RE = re.compile(r"pixiv\.net/(?:(?:en/)?users/|member\.php\?id=|u/)(\d+)")
 MISS_TTL = 7 * 86400
+REV_BATCH = 100       # pixiv names per live wiki lookup
+USER_BATCH = 40       # pixiv user urls per live artist lookup
+MAX_MULTI = 4         # a name listed on more pages than this is a grouping label
+MIN_SHARE = 0.01      # drop matches with <1% of the best match's post count
+REFRESH_AFTER = 6 * 3600
 
 
-KANA_RE = re.compile(r"[぀-ヿ]")
+KANA_RE = re.compile(r"[\u3040-\u30ff]")
+HAN_RE = re.compile(r"[\u3400-\u9fff]")
+HANGUL_RE = re.compile(r"[\uac00-\ud7af\u1100-\u11ff]")
+NOT_A_TAG = ("list_of_", "tag_group:", "pool_group:", "howto:", "help:", "about:")
 
 
 def _is_japanese_writable(s):
@@ -35,28 +43,33 @@ def _is_japanese_writable(s):
         return False
 
 
-def order_pixiv_names(names, seen=None):
+def order_pixiv_names(names, seen=None, ambiguous=()):
     """Best pixiv search name first.
 
     Danbooru's other_names usually start with the pixiv tag, but for many
-    general tags a Chinese name comes first ("长发", "双马尾"). So: names that
-    are actually seen on pixiv win; names that cannot be written in Japanese
-    go last; if the first name is Chinese, the page's other kanji-only names
-    (e.g. traditional "雙馬尾") are suspect too and kana names are preferred;
-    English-only names go after Japanese ones."""
+    general tags a Chinese name comes first ("长发", "双马尾"). Ranking:
+    1. names that also stand for other Danbooru tags ("黒髪ロング" is black_hair
+       and long_hair) go after exclusive names, so they never narrow a search;
+    2. Japanese names first, then English-only names, then names that cannot be
+       written in Japanese (simplified Chinese, Korean). If the first name is
+       Chinese, the page's other kanji-only names (e.g. traditional "雙馬尾") are
+       suspect too -- unless pixiv results have shown that spelling in use;
+    3. spellings seen more often in pixiv results; 4. Danbooru's order."""
     seen = seen or {}
     first_ok = bool(names) and _is_japanese_writable(names[0]) and not names[0].isascii()
 
     def score(item):
         i, n = item
-        s = i
+        k = key(n)
         if not _is_japanese_writable(n):
-            s += 1000
+            cls = 3
         elif n.isascii():
-            s += 300
-        elif not first_ok and not KANA_RE.search(n):
-            s += 500
-        return (-seen.get(key(n), 0), s)
+            cls = 1
+        elif not first_ok and not KANA_RE.search(n) and not seen.get(k):
+            cls = 2
+        else:
+            cls = 0
+        return (k in ambiguous, cls, -seen.get(k, 0), i)
     return [n for _, n in sorted(enumerate(names), key=score)]
 
 
@@ -117,6 +130,12 @@ CREATE INDEX IF NOT EXISTS artist_pixiv_artist ON artist_pixiv(artist);
 CREATE TABLE IF NOT EXISTS misses (key TEXT PRIMARY KEY, at REAL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, n INTEGER);
+CREATE TABLE IF NOT EXISTS aliases (antecedent TEXT PRIMARY KEY, consequent TEXT);
+CREATE TABLE IF NOT EXISTS learned (key TEXT, tag TEXT, raw TEXT, PRIMARY KEY (key, tag));
+CREATE INDEX IF NOT EXISTS learned_tag ON learned(tag);
+CREATE TABLE IF NOT EXISTS local_tags (display TEXT, pixiv TEXT, n INTEGER, PRIMARY KEY (display, pixiv));
+CREATE TABLE IF NOT EXISTS pixiv_users (user_id INTEGER PRIMARY KEY, account TEXT, name TEXT, display TEXT);
+CREATE INDEX IF NOT EXISTS pixiv_users_display ON pixiv_users(display);
 """
 
 
@@ -131,6 +150,9 @@ class Mapping:
         self.lock = threading.RLock()
         self.sync_lock = threading.Lock()
         self.sync_state = "idle"
+        self._pending = {"rev": set(), "user": set()}
+        self._pending_lock = threading.Lock()
+        self._worker = None
 
     # ================================================================ storage
     def _q(self, sql, args=()):
@@ -310,8 +332,15 @@ class Mapping:
         if rows:
             names = [r[0] for r in rows]
             keys = [key(n) for n in names]
-            seen = dict(self._q(f"SELECT key, n FROM seen WHERE key IN ({','.join('?' * len(keys))})", keys))
-            return order_pixiv_names(names, seen)
+            marks = ",".join("?" * len(keys))
+            seen = dict(self._q(f"SELECT key, n FROM seen WHERE key IN ({marks})", keys))
+            ambiguous = {r[0] for r in self._q(f"""SELECT key FROM names WHERE key IN ({marks}) AND rank < 1000
+                                                GROUP BY key HAVING COUNT(DISTINCT tag) > 1""", keys)}
+            names += [n for n in self._learned_names(tag) if n not in names]
+            return order_pixiv_names(names, seen, ambiguous)
+        learned = self._learned_names(tag)
+        if learned:
+            return learned
         if not self._q("SELECT 1 FROM wiki WHERE title=?", (tag,)) and self.cfg.live_lookups \
                 and not self._miss("wiki:" + tag):
             try:
@@ -325,35 +354,155 @@ class Mapping:
             self._set_miss(["wiki:" + tag])
         return []
 
-    def to_danbooru(self, pixiv_tags):
-        """[pixiv tag] -> {pixiv tag: danbooru tag}. Prefers wiki pages that list
-        the pixiv tag first, then more popular tags."""
+    def _learned_names(self, tag):
+        return [r[0] for r in self._q("SELECT raw FROM learned WHERE tag=?", (tag,))]
+
+    # ---------------------------------------------------------------- pixiv -> danbooru
+    def to_danbooru(self, pixiv_tags, translations=None):
+        """[pixiv tag] -> {pixiv tag: [danbooru tags]}.
+
+        One pixiv tag can stand for several Danbooru tags ("黒髪ロング" ->
+        black_hair + long_hair, "カイミク" -> kaito + hatsune_miku). Names the local
+        database does not know yet are looked up on Danbooru right away (a couple
+        of batched requests) and the rest in the background.
+
+        `translations` ({pixiv tag: pixiv's English translation}) is a fallback
+        for names no Danbooru wiki lists: if "夜空" is translated "night sky" and
+        night_sky is a Danbooru tag, it maps there (and is remembered)."""
+        pixiv_tags = [t for t in dict.fromkeys(pixiv_tags) if t]
         self._record_seen(pixiv_tags)
         out, missing = {}, []
         for t in pixiv_tags:
-            best = self._best(key(t))
-            if best:
-                out[t] = best
-            else:
+            tags = self._candidates(key(t))
+            if tags:
+                out[t] = tags
+            elif self.cfg.live_lookups and not self._miss("rev:" + key(t)):
                 missing.append(t)
-        # live reverse lookups only until the local database has been filled
-        if missing and self.cfg.live_lookups and not self.synced:
-            todo = [t for t in missing if " " not in t and not self._miss("rev:" + key(t))]
-            for i in range(0, len(todo), 40):
-                chunk = todo[i:i + 40]
+        if missing:
+            self._maybe_refresh()
+            budget = self.cfg.live_lookup_budget
+            for i in range(0, len(missing), REV_BATCH):
+                chunk = missing[i:i + REV_BATCH]
+                if budget <= 0:
+                    self._enqueue("rev", chunk)
+                    continue
+                budget -= 1
+                self._lookup_names(chunk)
+                for t in chunk:
+                    tags = self._candidates(key(t))
+                    if tags:
+                        out[t] = tags
+        if translations:
+            out.update(self._from_translations({t: translations[t] for t in pixiv_tags
+                                                if t not in out and translations.get(t)}))
+        return out
+
+    def _from_translations(self, pairs):
+        """{pixiv tag: english translation} -> {pixiv tag: [danbooru tag]} for
+        translations that are existing Danbooru tags."""
+        from_name = {}
+        for t, tr in pairs.items():
+            name = unicodedata.normalize("NFKC", tr).strip().lower().replace(" ", "_")
+            if name and not name.startswith(NOT_A_TAG):
+                from_name[t] = name
+        unknown = [n for n in set(from_name.values())
+                   if not self._q("SELECT 1 FROM tags WHERE name=?", (n,)) and not self._miss("tag:" + n)]
+        if unknown and self.cfg.live_lookups:
+            for i in range(0, len(unknown), 100):
+                chunk = unknown[i:i + 100]
                 try:
-                    pages = self.danbooru.get("/wiki_pages.json", {
-                        "search[other_names_include_any_lower]": " ".join(c.lower() for c in chunk),
-                        "only": "id,title,other_names,updated_at,is_deleted", "limit": 200})
+                    self._store_tags(self.danbooru.get("/tags.json", {
+                        "search[name_comma]": ",".join(chunk), "only": "id,name,category,post_count", "limit": 1000}))
                 except DanbooruError:
                     break
-                self._store_wiki(pages)
-                for t in chunk:
-                    best = self._best(key(t))
-                    if best:
-                        out[t] = best
-                self._set_miss(["rev:" + key(t) for t in chunk if t not in out])
+                self._set_miss(["tag:" + n for n in chunk if not self._q("SELECT 1 FROM tags WHERE name=?", (n,))])
+        empty = [n for n in set(from_name.values()) if not self._post_count(n)]
+        aliased = self.resolve_aliases(empty) if empty else {}
+        out, learned = {}, []
+        for t, name in from_name.items():
+            name = aliased.get(name, name)
+            if self._post_count(name):
+                out[t] = [name]
+                learned.append((key(t), name, t))
+        if learned:
+            with self.lock:
+                self.db.executemany("INSERT OR IGNORE INTO learned VALUES (?, ?, ?)", learned)
         return out
+
+    def _lookup_names(self, names):
+        if not names:
+            return
+        try:
+            pages = self.danbooru.get("/wiki_pages.json", {
+                "search[other_names_include_any_lower]": " ".join(n.lower() for n in names),
+                "only": "id,title,other_names,updated_at,is_deleted", "limit": 1000})
+        except DanbooruError as e:
+            log.info("live tag lookup failed: %s", e)
+            return
+        self._store_wiki(pages)
+        titles = [p["title"] for p in pages if not p.get("is_deleted")]
+        unknown = [t for t in titles if not self._q("SELECT 1 FROM tags WHERE name=?", (t,))]
+        for i in range(0, len(unknown), 100):
+            try:
+                self._store_tags(self.danbooru.get("/tags.json", {
+                    "search[name_comma]": ",".join(unknown[i:i + 100]), "only": "id,name,category,post_count",
+                    "limit": 1000}))
+            except DanbooruError:
+                break
+        self._set_miss(["rev:" + key(n) for n in names if not self._candidates(key(n))])
+
+    def _post_count(self, name):
+        rows = self._q("SELECT post_count FROM tags WHERE name=?", (name,))
+        return rows[0][0] if rows else 0
+
+    def resolve_aliases(self, names):
+        """Danbooru tag aliases ("kancolle" -> "kantai_collection") for names
+        that are not tags themselves; looked up on Danbooru in batches, cached."""
+        out, todo = {}, []
+        for n in dict.fromkeys(names):
+            rows = self._q("SELECT consequent FROM aliases WHERE antecedent=?", (n,))
+            if rows:
+                out[n] = rows[0][0]
+            elif self.cfg.live_lookups and not self._miss("alias:" + n):
+                todo.append(n)
+        for i in range(0, len(todo), 100):
+            chunk = todo[i:i + 100]
+            try:
+                found = self.danbooru.get("/tag_aliases.json", {
+                    "search[antecedent_name_comma]": ",".join(chunk), "search[status]": "active",
+                    "only": "antecedent_name,consequent_name", "limit": 1000})
+            except DanbooruError:
+                break
+            with self.lock:
+                self.db.executemany("INSERT OR REPLACE INTO aliases VALUES (?, ?)",
+                                    [(a["antecedent_name"], a["consequent_name"]) for a in found])
+            for a in found:
+                out[a["antecedent_name"]] = a["consequent_name"]
+                self.category(a["consequent_name"])  # make sure its category/count is known
+            self._set_miss(["alias:" + n for n in chunk if n not in out])
+        return out
+
+    def _candidates(self, k):
+        """Danbooru tags whose wiki lists this pixiv name, filtered for noise:
+        tags without posts (list pages, dead tags) are dropped; a match far less
+        popular than the best one is dropped (e.g. "ミク" is also listed on a
+        5-post Pokemon character); names listed on many pages are grouping labels
+        (costume series etc.), so they are left unmapped."""
+        rows = self._q("""SELECT n.tag, n.rank, t.post_count FROM names n LEFT JOIN tags t ON t.name = n.tag
+                          WHERE n.key=? ORDER BY n.rank, COALESCE(t.post_count, 0) DESC""", (k,))
+        # once tags are synced, a wiki title missing from the tags table is not a tag
+        tags_known = bool(self.meta_get("tags_synced_at"))
+        rows = [(tag, rank, pc) for tag, rank, pc in rows
+                if pc != 0 and not (pc is None and tags_known) and not tag.startswith(NOT_A_TAG)]
+        if not rows:
+            learned = self._q("SELECT tag FROM learned WHERE key=?", (k,))
+            return [r[0] for r in learned]
+        uniq = list(dict.fromkeys(tag for tag, _, _ in rows))
+        if len(uniq) > MAX_MULTI:
+            return []  # a grouping label (e.g. a costume series): no single right answer
+        top = max((pc or 0) for _, _, pc in rows)
+        keep = [tag for tag, _, pc in rows if pc is None or pc >= top * MIN_SHARE]
+        return list(dict.fromkeys(keep))
 
     def _record_seen(self, pixiv_tags):
         """Remember which spellings pixiv really uses (improves forward lookups over time)."""
@@ -363,28 +512,133 @@ class Mapping:
                 self.db.executemany("INSERT INTO seen VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n = n + 1",
                                     [(k,) for k in keys])
 
-    def _best(self, k):
-        rows = self._q("""SELECT n.tag FROM names n LEFT JOIN tags t ON t.name = n.tag
-                          WHERE n.key=? ORDER BY n.rank, COALESCE(t.post_count, 0) DESC LIMIT 1""", (k,))
-        return rows[0][0] if rows else None
-
+    # ---------------------------------------------------------------- artists
     def artist_for_user(self, user_id):
-        rows = self._q("SELECT artist FROM artist_pixiv WHERE pixiv_user_id=? ORDER BY artist LIMIT 1", (int(user_id),))
-        if rows:
-            return rows[0][0]
-        if self.cfg.live_lookups and not self.synced and not self._miss(f"user:{user_id}"):
-            try:
-                found = self.danbooru.get("/artists.json", {
-                    "search[url_matches]": f"https://www.pixiv.net/users/{int(user_id)}",
-                    "only": "id,name,updated_at,is_deleted,urls[url]"})
-            except DanbooruError:
-                found = []
-            self._store_artists(found)
-            rows = self._q("SELECT artist FROM artist_pixiv WHERE pixiv_user_id=? LIMIT 1", (int(user_id),))
+        return self.artists_for_users([user_id]).get(int(user_id))
+
+    def artists_for_users(self, user_ids):
+        """pixiv user ids -> Danbooru artist names; unknown ids are looked up on Danbooru."""
+        ids = [int(u) for u in dict.fromkeys(user_ids) if u]
+        out = self._artists_from_db(ids)
+        missing = [u for u in ids if u not in out and self.cfg.live_lookups and not self._miss(f"user:{u}")]
+        if missing:
+            self._maybe_refresh()
+            self._lookup_users(missing[:USER_BATCH])
+            self._enqueue("user", missing[USER_BATCH:])
+            out.update(self._artists_from_db(missing[:USER_BATCH]))
+        return out
+
+    def _artists_from_db(self, ids):
+        out = {}
+        for u in ids:
+            rows = self._q("SELECT artist FROM artist_pixiv WHERE pixiv_user_id=? ORDER BY artist LIMIT 1", (u,))
             if rows:
-                return rows[0][0]
-            self._set_miss([f"user:{user_id}"])
-        return None
+                out[u] = rows[0][0]
+        return out
+
+    def _lookup_users(self, ids):
+        if not ids:
+            return
+        try:
+            found = self.danbooru.get("/artists.json", {
+                "search[url_matches]": " ".join(f"https://www.pixiv.net/users/{u}" for u in ids),
+                "only": "id,name,updated_at,is_deleted,urls[url]", "limit": 1000})
+        except DanbooruError as e:
+            log.info("live artist lookup failed: %s", e)
+            return
+        self._store_artists(found)
+        known = self._artists_from_db(ids)
+        self._set_miss([f"user:{u}" for u in ids if u not in known])
+
+    # ---------------------------------------------------------------- background work
+    def _enqueue(self, kind, items):
+        if not items:
+            return
+        with self._pending_lock:
+            self._pending[kind].update(items)
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._drain, daemon=True)
+                self._worker.start()
+
+    def _drain(self):
+        while True:
+            with self._pending_lock:
+                if self._pending["rev"]:
+                    kind, pool = "rev", self._pending["rev"]
+                    size = REV_BATCH
+                elif self._pending["user"]:
+                    kind, pool = "user", self._pending["user"]
+                    size = USER_BATCH
+                else:
+                    return
+                batch = [pool.pop() for _ in range(min(size, len(pool)))]
+            try:
+                if kind == "rev":
+                    self._lookup_names([n for n in batch if not self._candidates(key(n))])
+                else:
+                    self._lookup_users([u for u in batch if not self._artists_from_db([u])])
+            except Exception as e:  # keep draining the queue
+                log.warning("background lookup failed: %s", e)
+
+    def wait_idle(self, timeout=30):
+        """Wait for background lookups to finish (used by tests and the sync command)."""
+        deadline = time.time() + timeout
+        while self._worker is not None and self._worker.is_alive() and time.time() < deadline:
+            time.sleep(0.05)
+
+    def _maybe_refresh(self):
+        """New names showed up: pull Danbooru's recent wiki/artist edits if the
+        last sync is more than a few hours old (runs in the background)."""
+        last = self.meta_get("last_sync")
+        if not self.synced or not last or self.sync_lock.locked():
+            return
+        try:
+            age = (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(last)).total_seconds()
+        except ValueError:
+            return
+        if age > REFRESH_AFTER:
+            threading.Thread(target=self.sync, daemon=True).start()
+
+    # ---------------------------------------------------------------- tags Danbooru doesn't have
+    def local_artist_name(self, user_id, account):
+        """Artist tag for a pixiv user with no Danbooru artist entry: the pixiv
+        account name, or "account_(user id)" if that name is already a Danbooru
+        tag (so it can't be confused with a different Danbooru artist)."""
+        rows = self._q("SELECT display FROM pixiv_users WHERE user_id=?", (int(user_id or 0),))
+        if rows and rows[0][0]:
+            return rows[0][0]
+        base = unicodedata.normalize("NFKC", account or "").strip().lower().replace(" ", "_") or "unknown_artist"
+        taken = self._q("SELECT 1 FROM tags WHERE name=?", (base,)) or             self._q("SELECT 1 FROM pixiv_users WHERE display=? AND user_id<>?", (base, int(user_id or 0)))
+        return f"{base}_({user_id})" if taken else base
+
+    def remember_local(self, tags, users):
+        """Store stand-in names (display -> pixiv tag / pixiv user) for later searches."""
+        with self.lock:
+            if tags:
+                self.db.executemany("""INSERT INTO local_tags VALUES (?, ?, 1)
+                                       ON CONFLICT(display, pixiv) DO UPDATE SET n = n + 1""", tags)
+            if users:
+                self.db.executemany("INSERT OR REPLACE INTO pixiv_users VALUES (?, ?, ?, ?)",
+                                    [(int(u), a, n, d) for u, a, n, d in users if u])
+
+    def local_pixiv_names(self, display):
+        return [r[0] for r in self._q("SELECT pixiv FROM local_tags WHERE display=? ORDER BY n DESC LIMIT 3", (display,))]
+
+    def local_users(self, display):
+        return [r[0] for r in self._q("SELECT user_id FROM pixiv_users WHERE display=?", (display,))]
+
+    # ---------------------------------------------------------------- danbooru -> pixiv
+    def search_names(self, tag, limit=3):
+        """pixiv names to OR together when searching for a Danbooru tag: the best
+        Japanese names plus the best Chinese name (for works tagged in Chinese)."""
+        names = [n for n in self.pixiv_names(tag) if not (n.isascii() and "_" in n)]
+        if limit <= 1 or len(names) <= 1:
+            return names[:1]
+        japanese = [n for n in names if _is_japanese_writable(n)]
+        chinese = [n for n in names if not _is_japanese_writable(n) and HAN_RE.search(n) and not HANGUL_RE.search(n)]
+        if not japanese:
+            return chinese[:limit]
+        return japanese[:limit - 1] + (chinese[:1] or japanese[limit - 1:limit])
 
     def users_for_artist(self, name):
         rows = self._q("SELECT pixiv_user_id FROM artist_pixiv WHERE artist=?", (name,))

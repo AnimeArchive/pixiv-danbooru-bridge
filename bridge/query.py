@@ -318,18 +318,52 @@ class Planner:
     def __init__(self, cfg, mapping):
         self.cfg, self.mapping = cfg, mapping
 
-    def pixiv_word(self, tag):
+    def pixiv_names(self, tag):
+        """pixiv tags to search for a Danbooru tag: an override, the tag's pixiv
+        names from Danbooru (best Japanese names + a Chinese one), the pixiv tag
+        behind a stand-in name the bridge showed earlier, or the name as typed."""
         if tag in self.cfg.tag_overrides:
-            return self.cfg.tag_overrides[tag]
-        names = self.mapping.pixiv_names(tag)
-        return names[0] if names else tag
+            return [self.cfg.tag_overrides[tag]]
+        names = self.mapping.search_names(tag, self.cfg.search_aliases)
+        return names or self.mapping.local_pixiv_names(tag) or [tag]
+
+    @staticmethod
+    def group(names):
+        # pixiv syntax: AAA (BBB OR CCC), with spaces around the parentheses
+        return names[0] if len(names) == 1 else "(" + " OR ".join(names) + ")"
+
+    def artist_users(self, tag):
+        """pixiv user ids for an artist tag: Danbooru's artist database, or a
+        pixiv account the bridge has shown under that stand-in name."""
+        cat, _ = self.mapping.category(tag)
+        users = self.mapping.users_for_artist(tag) if cat == 1 else []
+        return users or self.mapping.local_users(tag)
+
+    def resolve_aliases(self, tree):
+        """Rename aliased tags in the query ("kancolle" -> "kantai_collection"), like Danbooru does."""
+        nodes, stack = [], [tree]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, Tag) and "*" not in n.name:
+                nodes.append(n)
+            elif isinstance(n, Not):
+                stack.append(n.item)
+            elif isinstance(n, (And, Or)):
+                stack.extend(n.items)
+        unknown = [n.name for n in nodes if n.name not in self.cfg.tag_overrides
+                   and self.mapping.category(n.name)[1] == 0]
+        if unknown:
+            aliases = self.mapping.resolve_aliases(unknown)
+            for n in nodes:
+                n.name = aliases.get(n.name, n.name)
 
     def plan(self, query):
         p = Plan()
         tree = parse(query)
+        self.resolve_aliases(tree)
         p.tree = tree
         items = top_level(tree)
-        positive_tags, artist_tag, or_group = [], None, None
+        positive_tags, artist_tag, or_groups = [], None, []
         order = ""
         for n in items:
             if isinstance(n, Meta):
@@ -380,18 +414,17 @@ class Planner:
                 if t in ("ai-generated", "ai_generated"):
                     p.exclude_ai = True
                 else:
-                    p.word_terms.append("-" + self.pixiv_word(t))
+                    p.word_terms += ["-" + n for n in self.pixiv_names(t)]
             elif isinstance(n, Not) and isinstance(n.item, Meta) and n.item.k == "is" and n.item.v.lower() == "ai":
                 p.exclude_ai = True
             elif isinstance(n, Tag) and "*" not in n.name:
-                cat, _ = self.mapping.category(n.name)
-                users = self.mapping.users_for_artist(n.name) if cat == 1 else []
-                if users and artist_tag is None:
+                users = self.artist_users(n.name) if artist_tag is None else []
+                if users:
                     artist_tag = (n.name, users)
                 else:
                     positive_tags.append(n.name)
             elif isinstance(n, Or) and all(isinstance(i, Tag) and "*" not in i.name for i in n.items):
-                or_group = [i.name for i in n.items]
+                or_groups.append([i.name for i in n.items])
 
         if order not in SORTS:
             raise QueryError(f"unknown order: {order}")
@@ -401,10 +434,13 @@ class Planner:
         if p.source in ("search",) and artist_tag:
             p.source, p.user_ids = "user", artist_tag[1]
         if p.source == "search":
-            if positive_tags:
-                p.word_terms[:0] = [self.pixiv_word(t) for t in positive_tags]
-            elif or_group:
-                p.word_terms[:0] = [" OR ".join(self.pixiv_word(t) for t in or_group)]
+            terms = [self.group(self.pixiv_names(t)) for t in positive_tags]
+            for grp in or_groups:
+                names = [n for t in grp for n in self.pixiv_names(t)]
+                terms.append(self.group(list(dict.fromkeys(names))))
+            if len(terms) == 1 and terms[0].startswith("(") and not p.word_terms:
+                terms[0] = terms[0][1:-1]  # a lone OR group needs no parentheses
+            p.word_terms[:0] = terms
             if not any(not w.startswith("-") for w in p.word_terms):
                 # nothing pixiv can search for: browse a feed and filter locally
                 p.word_terms = []

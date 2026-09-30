@@ -375,11 +375,11 @@ class Bridge:
             mapped = self.mapping.to_danbooru([s["name"] for s in sugg])
             seen = set()
             for s in sugg:
-                d = mapped.get(s["name"])
-                if d and d not in seen:
-                    seen.add(d)
-                    cat, count = self.mapping.category(d)
-                    rows.append((d, cat or 0, count))
+                for d in mapped.get(s["name"]) or []:
+                    if d not in seen:
+                        seen.add(d)
+                        cat, count = self.mapping.category(d)
+                        rows.append((d, cat or 0, count))
         out = []
         for name, cat, count in rows[:limit]:
             if kind == "artist":
@@ -428,8 +428,7 @@ class Bridge:
             rows = [(booru_name(a), tag) for a in self.mapping.aliases(tag)]
         elif ant:
             mapped = self.mapping.to_danbooru([ant])
-            if ant in mapped:
-                rows = [(booru_name(ant), mapped[ant])]
+            rows = [(booru_name(ant), d) for d in mapped.get(ant) or []]
         from .convert import boot_ts, stable_id
         body = [{"id": stable_id(f"{a}->{c}"), "antecedent_name": a, "reason": "pixiv name (Danbooru wiki other_names)",
                  "creator_id": 1, "consequent_name": c, "status": "active", "forum_topic_id": None,
